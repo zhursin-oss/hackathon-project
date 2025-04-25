@@ -1,65 +1,83 @@
 import telebot
+import requests
 
-TOKEN = "7611949438:AAE425r384GRiDh6YJuiLbSAl6AmgeWo5Zw"
-bot = telebot.TeleBot(TOKEN)
+API_TOKEN = '7611949438:AAE425r384GRiDh6YJuiLbSAl6AmgeWo5Zw'
+HUGGINGFACE_API_KEY = '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'
 
-# Храним состояние пользователя
-user_state = {}
-user_language = {}
+bot = telebot.TeleBot(API_TOKEN)
 
-# Языки
+# Храним язык пользователя
+user_lang = {}
+
 languages = {
-    "kz": "Қазақ тілі",
-    "ru": "Русский",
-    "en": "English",
-    "tr": "Türkçe"
-}
-
-# Симптом -> Болезнь
-symptom_to_disease = {
-    "голова": ("Головная боль", False),
-    "кашель": ("Простуда", False),
-    "температура": ("Грипп", False),
-    "боль в груди": ("Проблемы с сердцем", True),
-    "живот": ("Отравление", False)
+    'kk': 'Қазақша',
+    'ru': 'Русский',
+    'en': 'English',
+    'tr': 'Türkçe'
 }
 
 @bot.message_handler(commands=['start'])
-def start_message(message):
+def start(message):
+    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
+    for code, lang in languages.items():
+        markup.add(telebot.types.KeyboardButton(lang))
+    bot.send_message(message.chat.id, "Менің атым MediBot. Тілді таңдаңыз / Выберите язык / Choose language / Dil seçin:", reply_markup=markup)
+
+@bot.message_handler(func=lambda msg: msg.text in languages.values())
+def set_language(message):
+    for code, lang in languages.items():
+        if message.text == lang:
+            user_lang[message.chat.id] = code
+            greetings = {
+                'kk': "Симптомдарыңызды жазыңыз",
+                'ru': "Напишите ваши симптомы",
+                'en': "Please type your symptoms",
+                'tr': "Lütfen belirtilerinizi yazınız"
+            }
+            bot.send_message(message.chat.id, greetings[code])
+            break
+
+@bot.message_handler(content_types=['text'])
+def handle_symptoms(message):
+    lang = user_lang.get(message.chat.id, 'en')
+    prompt = f"User symptoms: {message.text}\nRespond in {lang}."
+    headers = {
+        "Authorization": f"Bearer {HUGGINGFACE_API_KEY}"
+    }
+    json = {
+        "inputs": prompt
+    }
+    response = requests.post("https://api-inference.huggingface.co/models/google/flan-t5-base", headers=headers, json=json)
+    if response.status_code == 200:
+        result = response.json()
+        if isinstance(result, list) and 'generated_text' in result[0]:
+            reply = result[0]['generated_text']
+        else:
+            reply = "Жауап алу мүмкін болмады. Қайталап көріңіз / Не удалось получить ответ / Could not get answer / Yanıt alınamadı."
+    else:
+        reply = "Сервер қатесі / Ошибка сервера / Server error / Sunucu hatası."
+
+    bot.send_message(message.chat.id, reply)
+
+    if any(word in message.text.lower() for word in ['ауыр', 'болит', 'pain', 'ağrı']):
+        send_location_request(message.chat.id, lang)
+
+def send_location_request(chat_id, lang):
+    text = {
+        'kk': "Орналасқан жеріңізді жіберіңіз, жақын аурухананы көрсетемін.",
+        'ru': "Отправьте ваше местоположение, покажу ближайшую больницу.",
+        'en': "Send your location to show the nearest hospital.",
+        'tr': "Konumunuzu gönderin, en yakın hastaneyi göstereyim."
+    }
     markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True)
-    for lang in languages.values():
-        markup.add(lang)
-    bot.send_message(message.chat.id, "Сәлем! Мен — сенің медициналық көмекшің MediBot.\nАлдымен тіл таңдаңыз:", reply_markup=markup)
-    user_state[message.chat.id] = "choose_language"
+    button = telebot.types.KeyboardButton(text[lang], request_location=True)
+    markup.add(button)
+    bot.send_message(chat_id, text[lang], reply_markup=markup)
 
-@bot.message_handler(func=lambda msg: True)
-def handle_message(message):
-    chat_id = message.chat.id
-    text = message.text.strip().lower()
+@bot.message_handler(content_types=['location'])
+def handle_location(message):
+    lat = message.location.latitude
+    lon = message.location.longitude
+    bot.send_message(message.chat.id, f"Міне, сізге жақын ауруханалар:\nhttps://www.google.com/maps/search/hospital/@{lat},{lon},14z")
 
-    # Шаг 1: выбор языка
-    if user_state.get(chat_id) == "choose_language":
-        for key, value in languages.items():
-            if value.lower() in text:
-                user_language[chat_id] = key
-                user_state[chat_id] = "ask_symptom"
-                bot.send_message(chat_id, "Симптомыңызды жазыңыз / Напишите ваш симптом / Write your symptom / Semptomunuzu yazın:")
-                return
-        bot.send_message(chat_id, "Тілді дұрыс таңдаңыз.")
-
-    # Шаг 2: ввод симптома
-    elif user_state.get(chat_id) == "ask_symptom":
-        response = check_symptom(text)
-        bot.send_message(chat_id, response)
-
-def check_symptom(symptom_text):
-    for key in symptom_to_disease:
-        if key in symptom_text:
-            disease, is_serious = symptom_to_disease[key]
-            if is_serious:
-                return f"Бұл қауіпті болуы мүмкін: {disease}. Жақын ауруханаға барыңыз!"
-            else:
-                return f"Сізде {disease}. Үйде емделуге болады. Көп су ішіңіз, демалыңыз."
-    return "Кешіріңіз, бұл симптом бойынша менде мәлімет жоқ."
-
-bot.polling()
+bot.polling(non_stop=True)
