@@ -2,7 +2,6 @@ import telebot
 import requests
 import logging
 
-# Твои токены
 TELEGRAM_TOKEN = '7611949438:AAE425r384GRiDh6YJuiLbSAl6AmgeWo5Zw'
 HUGGINGFACE_API_KEY = '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'
 
