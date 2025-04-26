@@ -1,136 +1,187 @@
-import telebot
-import requests
 import logging
+import requests
+from langdetect import detect
+from telegram import Update, KeyboardButton, ReplyKeyboardMarkup
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+import os
 
-TELEGRAM_TOKEN = '7611949438:AAE425r384GRiDh6YJuiLbSAl6AmgeWo5Zw'
-HUGGINGFACE_API_KEY = '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'
+TELEGRAM_TOKEN = "7611949438:AAE425r384GRiDh6YJuiLbSAl6AmgeWo5Zw"
+HUGGINGFACE_API_KEY = "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"
 
-# Настройки моделей
-MODEL_NAME = 'google/flan-t5-large'
-TRANSLATION_MODELS = {
-    'Kazakh': ('kk', 'en'),
-    'Russian': ('ru', 'en'),
-    'Turkish': ('tr', 'en'),
-    'English': (None, None)  # Без перевода
-}
-
-# Инициализация бота
-bot = telebot.TeleBot(TELEGRAM_TOKEN)
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Храним выбранный язык и ожидание симптомов
-user_language = {}
-user_waiting_symptoms = {}
+# Функция для определения языка входящего текста
+def detect_language(text: str) -> str:
+    try:
+        return detect(text)  # Возвращает код языка, например, "ru", "en", "tr", "kk" и т.п.
+    except Exception as e:
+        logger.error(f"Ошибка определения языка: {e}")
+        return "en"  # По умолчанию английский
 
-# Доступные языки
-languages = {
-    'Қазақша': 'Kazakh',
-    'Русский': 'Russian',
-    'English': 'English',
-    'Türkçe': 'Turkish'
-}
+# Функция перевода через Hugging Face (с использованием модели Helsinki‑NLP)
+def translate_text(text: str, source_lang: str, target_lang: str) -> str:
+    # Для перевода с русского на английский используем модель opus-mt-ru-en,
+    # для турецкого – opus-mt-tr-en и т.д.
+    # Если source_lang == target_lang – возвращаем текст без изменений.
+    if source_lang.lower() == target_lang.lower():
+        return text
 
-# Команда /start
-@bot.message_handler(commands=['start'])
-def start(message):
-    markup = telebot.types.ReplyKeyboardMarkup(resize_keyboard=True)
-    for lang in languages.keys():
-        markup.add(lang)
-    bot.send_message(message.chat.id, "Тілді таңдаңыз / Выберите язык / Select a language / Bir dil seçin:", reply_markup=markup)
-
-# Выбор языка
-@bot.message_handler(func=lambda message: message.text in languages.keys())
-def choose_language(message):
-    lang = languages[message.text]
-    user_language[message.chat.id] = lang
-    user_waiting_symptoms[message.chat.id] = True
-
-    greetings = {
-        'Kazakh': "Сәлеметсіз бе! Мен сіздің медициналық көмекшіңіз МедиБотпын. Симптомдарыңызды жазыңыз.",
-        'Russian': "Привет! Я твой медицинский помощник Медибот. Напишите свои симптомы.",
-        'English': "Hello! I'm your medical assistant MediBot. Please describe your symptoms.",
-        'Turkish': "Merhaba! Ben sizin tıbbi yardımcınız MediBot'um. Lütfen belirtilerinizi yazınız."
+    # Составляем имя модели; пока реализуем только для ru, tr и en.
+    model_map = {
+        ("ru", "en"): "Helsinki-NLP/opus-mt-ru-en",
+        ("en", "ru"): "Helsinki-NLP/opus-mt-en-ru",
+        ("tr", "en"): "Helsinki-NLP/opus-mt-tr-en",
+        ("en", "tr"): "Helsinki-NLP/opus-mt-en-tr",
+        # Для казахского можно попробовать, но модели типа opus-mt-kk-en могут отсутствовать.
     }
+    key = (source_lang.lower(), target_lang.lower())
+    if key not in model_map:
+        # Если модели для данной пары нет, возвращаем оригинальный текст.
+        return text
 
-    bot.send_message(message.chat.id, greetings[lang])
-
-# Обработка симптомов
-@bot.message_handler(func=lambda message: user_waiting_symptoms.get(message.chat.id, False))
-def handle_symptoms(message):
-    symptoms = message.text
-    lang = user_language.get(message.chat.id, 'English')
+    model_name = model_map[key]
+    url = f"https://api-inference.huggingface.co/models/{model_name}"
+    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}"}
+    payload = {"inputs": text}
 
     try:
-        # Переводим симптомы на английский
-        symptoms_in_english = translate_text(symptoms, TRANSLATION_MODELS[lang][0], 'en') if lang != 'English' else symptoms
-
-        # Отправляем симптомы в Hugging Face
-        diagnosis = ask_huggingface(symptoms_in_english)
-
-        if diagnosis:
-            # Перевод обратно на нужный язык
-            final_diagnosis = translate_text(diagnosis, 'en', TRANSLATION_MODELS[lang][0]) if lang != 'English' else diagnosis
-            bot.send_message(message.chat.id, final_diagnosis.strip())
+        response = requests.post(url, headers=headers, json=payload, timeout=10)
+        response.raise_for_status()
+        result = response.json()
+        translation = result[0].get("translation_text", None)
+        if translation:
+            return translation.strip()
         else:
-            send_error_message(message.chat.id)
+            logger.error(f"Ошибка перевода, ответ: {result}")
+            return text
     except Exception as e:
-        logging.error(f"Ошибка: {e}")
-        send_error_message(message.chat.id)
+        logger.error(f"Translation API error: {e}")
+        # Возвращаем сообщение об ошибке (как запрос от пользователя)
+        return "Переводчик временно недоступен, пожалуйста, повторите попытку позже."
 
-def send_error_message(chat_id):
-    bot.send_message(chat_id, "Қате пайда болды, кейінірек қайталап көріңіз.\nПроизошла ошибка, попробуйте позже.\nAn error occurred, please try again later.\nBir hata oluştu, lütfen daha sonra tekrar deneyin.")
-
-def ask_huggingface(symptoms_text):
-    prompt = f"""Определи болезнь на основе симптомов: {symptoms_text}.
-Кратко опиши (1 предложение).
-Дай рекомендацию: домашнее лечение или обратиться в больницу."""
-
-    headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {
-        "inputs": prompt,
-        "parameters": {
-            "temperature": 0.7,
-            "max_new_tokens": 200
-        }
-    }
-    response = requests.post(
-        f"https://api-inference.huggingface.co/models/{MODEL_NAME}",
-        headers=headers,
-        json=payload
+# Функция анализа симптомов (запрос к Hugging Face модели)
+def analyze_symptoms(symptoms_english: str) -> str:
+    prompt = (
+        f"Based on the following symptoms: {symptoms_english}\n"
+        f"Identify the illness in one sentence and then provide a recommendation: either 'home treatment' or 'go to the hospital'."
     )
-    if response.status_code == 200:
-        return response.json()[0]['generated_text']
-    else:
-        logging.error(f"HuggingFace API error: {response.status_code} {response.text}")
+    url = "https://api-inference.huggingface.co/models/google/flan-t5-large"
+    headers = {"Authorization": f"Bearer {HUGGINGFACE_API_KEY}", "Content-Type": "application/json"}
+    payload = {"inputs": prompt, "parameters": {"temperature": 0.7, "max_new_tokens": 150}}
+
+    try:
+        response = requests.post(url, headers=headers, json=payload, timeout=15)
+        response.raise_for_status()
+        result = response.json()
+        diagnosis = result[0].get("generated_text", "").strip()
+        return diagnosis
+    except Exception as e:
+        logger.error(f"HuggingFace API error in analyze_symptoms: {e}")
         return None
 
-def translate_text(text, source_lang, target_lang):
-    if not source_lang or not target_lang:
-        return text
+# Функция поиска ближайших больниц через Overpass API (OpenStreetMap)
+def get_nearby_hospitals(lat: float, lon: float) -> list:
+    query = f"""
+    [out:json];
+    (
+      node["amenity"="hospital"](around:5000,{lat},{lon});
+      way["amenity"="hospital"](around:5000,{lat},{lon});
+      relation["amenity"="hospital"](around:5000,{lat},{lon});
+    );
+    out center;
+    """
+    url = "http://overpass-api.de/api/interpreter"
+    try:
+        response = requests.post(url, data={"data": query}, timeout=15)
+        response.raise_for_status()
+        data = response.json()
+        hospitals = []
+        for element in data.get("elements", []):
+            # Попытка извлечь имя
+            name = element.get("tags", {}).get("name", "Без названия")
+            hospitals.append(name)
+        return hospitals
+    except Exception as e:
+        logger.error(f"Overpass API error: {e}")
+        return None
 
-    model_id = f"Helsinki-NLP/opus-mt-{source_lang}-{target_lang}"
+# Глобальная переменная, чтобы отметить, что пользователю надо запросить геолокацию
+# Если диагноз содержит ключевое слово "hospital" (в английском ответе), считаем ситуацию серьёзной.
+# Для простоты будем искать подстроку "hospital" в diagnosis (можно расширить).
+pending_hospital_request = {}
 
-    headers = {
-        "Authorization": f"Bearer {HUGGINGFACE_API_KEY}",
-        "Content-Type": "application/json"
-    }
-    payload = {"inputs": text}
-    response = requests.post(
-        f"https://api-inference.huggingface.co/models/{model_id}",
-        headers=headers,
-        json=payload
-    )
+# Обработчик команды /start
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text("Привет! Напишите ваши симптомы. Я помогу определить, нужно ли обращаться в больницу.")
 
-    if response.status_code == 200:
-        translated_text = response.json()[0]['translation_text']
-        return translated_text
+# Обработчик текстовых сообщений (симптомы)
+async def handle_symptoms(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_text = update.message.text
+    chat_id = update.message.chat_id
+
+    # Определяем язык исходного текста
+    source_lang = detect_language(user_text)
+    # Если не английский, переводим симптомы на английский
+    if source_lang != "en":
+        symptoms_english = translate_text(user_text, source_lang, "en")
     else:
-        logging.error(f"Translation API error: {response.status_code} {response.text}")
-        return text
+        symptoms_english = user_text
 
-# Запуск бота
+    if not symptoms_english:
+        await update.message.reply_text("Не удалось обработать ваши симптомы. Попробуйте еще раз.")
+        return
+
+    # Анализируем симптомы (на английском)
+    diagnosis_english = analyze_symptoms(symptoms_english)
+    if diagnosis_english is None:
+        await update.message.reply_text("Извините, я не смог определить заболевание. Попробуйте позже.")
+        return
+
+    # Теперь, если исходный язык не английский, переводим диагноз обратно
+    if source_lang != "en":
+        diagnosis = translate_text(diagnosis_english, "en", source_lang)
+    else:
+        diagnosis = diagnosis_english
+
+    await update.message.reply_text(f"Диагноз: {diagnosis}")
+
+    # Если в диагнозе содержится слово "hospital" (или аналог) - считаем, что нужно обращаться в больницу
+    if "hospital" in diagnosis_english.lower() or "go to the hospital" in diagnosis_english.lower():
+        pending_hospital_request[chat_id] = True
+        # Спрашиваем пользователя отправить геолокацию через кнопку
+        location_button = KeyboardButton("Отправить геолокацию", request_location=True)
+        reply_markup = ReplyKeyboardMarkup([[location_button]], resize_keyboard=True, one_time_keyboard=True)
+        await update.message.reply_text("Обнаружена серьёзная ситуация. Пожалуйста, отправьте свою геолокацию для поиска ближайших больниц.", reply_markup=reply_markup)
+    else:
+        pending_hospital_request[chat_id] = False
+
+# Обработчик геолокации
+async def handle_location(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    chat_id = update.message.chat_id
+    if not pending_hospital_request.get(chat_id, False):
+        await update.message.reply_text("Спасибо за геолокацию.")
+        return
+
+    loc = update.message.location
+    lat, lon = loc.latitude, loc.longitude
+    hospitals = get_nearby_hospitals(lat, lon)
+    if hospitals:
+        hospitals_list = "\n".join(hospitals[:5])  # выведем 5 ближайших
+        await update.message.reply_text(f"Ближайшие больницы:\n{hospitals_list}")
+    else:
+        await update.message.reply_text("Извините, не удалось найти ближайшие больницы.")
+    pending_hospital_request[chat_id] = False
+
+# Основной запуск
+def main():
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_symptoms))
+    app.add_handler(MessageHandler(filters.LOCATION, handle_location))
+
+    app.run_polling()
+
 if __name__ == "__main__":
-    bot.polling(non_stop=True)
+    main()
